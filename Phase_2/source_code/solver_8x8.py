@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 import os
@@ -233,3 +232,4 @@ if __name__ == "__main__":
             print(f"Error {f}: {e}")
             
     if count: print(f"Avg: {total_acc/count:.2f}%")
+    
