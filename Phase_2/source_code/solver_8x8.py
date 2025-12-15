@@ -1,235 +1,274 @@
 import cv2
 import numpy as np
 import os
+import heapq
 
 # =====================================================
 # 1. CONFIGURATION
 # =====================================================
-N = 8
-PUZZLE_FOLDER = "D:/Image_Proccessing/Project/Gravity Falls/puzzle_8x8"      # Folder containing scrambled puzzles
-CORRECT_FOLDER = "D:/Image_Proccessing/Project/Gravity Falls/correct"        # Folder containing correct original images
-OUTPUT_FOLDER = "results/8x8" 
-EPS = 1e-6
+PUZZLE_N = 8
+PUZZLE_FOLDER = "D:/Image_Proccessing/Project/Gravity Falls/puzzle_8x8"
+CORRECT_FOLDER = "D:/Image_Proccessing/Project/Gravity Falls/correct"
+OUTPUT_FOLDER = "results/8x8"
 
 # =====================================================
-# 2. ADVANCED SOLVER (Best Buddies + PBC)
+# 2. MEMORY-EFFICIENT A* SOLVER
 # =====================================================
-class JigsawSolverBestBuddies:
-    def __init__(self, image_path):
-        self.img_bgr = cv2.imread(image_path)
+class EfficientAStarSolver8x8:
+    def __init__(self, puzzle_path, correct_path=None):
+        self.img_bgr = cv2.imread(puzzle_path)
         if self.img_bgr is None:
-            raise ValueError(f"Could not load {image_path}")
+            raise ValueError(f"Could not load puzzle: {puzzle_path}")
+
+        # Load Correct Image for ID mapping
+        self.correct_bgr = None
+        if correct_path and os.path.exists(correct_path):
+            self.correct_bgr = cv2.imread(correct_path)
+
+        # Split scrambled image
+        self.pieces_bgr_scrambled = self._split(self.img_bgr)
+        self.pieces_lab_scrambled = [cv2.cvtColor(p, cv2.COLOR_BGR2LAB).astype(np.float32) for p in self.pieces_bgr_scrambled]
+        self.n = len(self.pieces_lab_scrambled)
         
-        # Paper suggests LAB color space is best
-        self.img_lab = cv2.cvtColor(self.img_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
-        self.pieces = self._split_image(self.img_lab, N)
-        self.pieces_bgr = self._split_image(self.img_bgr, N)
-        self.num_pieces = len(self.pieces)
+        # Mapping: Scrambled Index -> True ID
+        self.id_map = self._map_pieces_to_truth()
 
-    def _split_image(self, img, N):
-        h, w, _ = img.shape
-        ph, pw = h // N, w // N
-        pieces = []
-        for i in range(N):
-            for j in range(N):
-                pieces.append(img[i*ph:(i+1)*ph, j*pw:(j+1)*pw])
-        return pieces
+        # Precompute costs
+        self.H, self.V = self._compute_costs()
+        self.best_buddy_costs = self._compute_best_buddies()
 
-    def _prediction_compatibility(self, p1, p2, relation):
-        """
-        Implements the Prediction-Based Compatibility (PBC) from the paper.
-        It predicts the next row/col of pixels based on gradients.
-        """
-        # Extract boundaries
-        if relation == "horizontal": # p1 Left, p2 Right
-            # Predict p2's left edge from p1's right edge
-            # Taylor expansion: f(x+1) = f(x) + f'(x)
-            # p1_right_edge = p1[:,-1]
-            # p1_grad = p1[:,-1] - p1[:,-2]
-            # prediction = p1_right_edge + p1_grad
+    def _split(self, img):
+        h, w = img.shape[:2]
+        ph, pw = h // PUZZLE_N, w // PUZZLE_N
+        return [img[r*ph:(r+1)*ph, c*pw:(c+1)*pw] for r in range(PUZZLE_N) for c in range(PUZZLE_N)]
+
+    def _map_pieces_to_truth(self):
+        """Matches scrambled pieces to ground truth IDs"""
+        if self.correct_bgr is None:
+            return {i: i for i in range(self.n)}
+
+        true_pieces = self._split(self.correct_bgr)
+        mapping = {}
+        
+        for s_idx, s_piece in enumerate(self.pieces_bgr_scrambled):
+            best_diff = float('inf')
+            best_true_id = -1
             
-            p1_edge = p1[:, -1, :]
-            p1_inner = p1[:, -2, :]
-            p2_edge = p2[:, 0, :]
+            for t_idx, t_piece in enumerate(true_pieces):
+                if s_piece.shape != t_piece.shape:
+                    t_piece = cv2.resize(t_piece, (s_piece.shape[1], s_piece.shape[0]))
+                
+                diff = np.sum(np.abs(s_piece.astype(int) - t_piece.astype(int)))
+                if diff < best_diff:
+                    best_diff = diff
+                    best_true_id = t_idx
             
-            prediction = p1_edge + (p1_edge - p1_inner)
-            diff = np.mean(np.abs(prediction - p2_edge))
-            return diff
-            
-        elif relation == "vertical": # p1 Top, p2 Bottom
-            p1_edge = p1[-1, :, :]
-            p1_inner = p1[-2, :, :]
-            p2_edge = p2[0, :, :]
-            
-            prediction = p1_edge + (p1_edge - p1_inner)
-            diff = np.mean(np.abs(prediction - p2_edge))
-            return diff
-        return float('inf')
+            mapping[s_idx] = best_true_id
+        return mapping
+
+    def _border_cost(self, p1, side, p2):
+        if side == 'H':
+            edge1, inner1 = p1[:, -1], p1[:, -2]
+            edge2 = p2[:, 0]
+        else:
+            edge1, inner1 = p1[-1, :], p1[-2, :]
+            edge2 = p2[0, :]
+        
+        color_diff = np.sum(np.abs(edge1 - edge2))
+        grad1 = edge1 - inner1
+        grad2 = edge2 - edge1
+        grad_diff = np.sum(np.abs(grad2 - grad1))
+        
+        return color_diff + 1.5 * grad_diff
+
+    def _compute_costs(self):
+        H = np.full((self.n, self.n), np.inf)
+        V = np.full((self.n, self.n), np.inf)
+        
+        for i in range(self.n):
+            for j in range(self.n):
+                if i == j: continue
+                H[i,j] = self._border_cost(self.pieces_lab_scrambled[i], 'H', self.pieces_lab_scrambled[j])
+                V[i,j] = self._border_cost(self.pieces_lab_scrambled[i], 'V', self.pieces_lab_scrambled[j])
+        
+        return H, V
+
+    def _compute_best_buddies(self):
+        best = np.zeros(self.n)
+        for i in range(self.n):
+            min_cost = np.inf
+            for j in range(self.n):
+                if i != j:
+                    min_cost = min(min_cost, self.H[i,j], self.H[j,i], self.V[i,j], self.V[j,i])
+            best[i] = min_cost if min_cost != np.inf else 0
+        return best
+
+    def _heuristic(self, placed_mask):
+        return sum(self.best_buddy_costs[i] for i in range(self.n) if not placed_mask[i])
 
     def solve(self):
-        n = self.num_pieces
+        # Find best seed (highest variance piece)
+        variances = [np.std(p) for p in self.pieces_lab_scrambled]
+        seed_id = int(np.argmax(variances))
         
-        # 1. Calculate Pairwise Compatibilities
-        # H_cost[i, j] = Cost of (i) being Left of (j)
-        # V_cost[i, j] = Cost of (i) being Top of (j)
-        H_cost = np.full((n, n), np.inf)
-        V_cost = np.full((n, n), np.inf)
+        # State: grid as flat array, placed mask
+        grid = np.full(self.n, -1, dtype=np.int32)
+        grid[0] = seed_id
         
-        for i in range(n):
-            for j in range(n):
-                if i == j: continue
-                H_cost[i,j] = self._prediction_compatibility(self.pieces[i], self.pieces[j], "horizontal")
-                V_cost[i,j] = self._prediction_compatibility(self.pieces[i], self.pieces[j], "vertical")
-
-        # 2. Find "Best Buddies"
-        # Two pieces are best buddies if they mutually pick each other as best match
-        matches = [] # List of (p1, p2, relation, score)
+        placed = np.zeros(self.n, dtype=bool)
+        placed[seed_id] = True
         
-        # Horizontal Best Buddies
-        for i in range(n):
-            best_j = np.argmin(H_cost[i, :]) # Who does i like best?
-            best_i_for_j = np.argmin(H_cost[:, best_j]) # Who does j like best?
+        g_cost = 0
+        
+        for step in range(1, self.n):
+            best_move = None
+            best_f = np.inf
             
-            if i == best_i_for_j: # Mutual love!
-                matches.append((i, best_j, "H", H_cost[i, best_j]))
+            for idx in range(self.n):
+                if grid[idx] != -1: continue
                 
-        # Vertical Best Buddies
-        for i in range(n):
-            best_j = np.argmin(V_cost[i, :])
-            best_i_for_j = np.argmin(V_cost[:, best_j])
-            
-            if i == best_i_for_j:
-                matches.append((i, best_j, "V", V_cost[i, best_j]))
-
-        # 3. Assemble Clusters
-        # Sort matches by reliability (score)
-        matches.sort(key=lambda x: x[3])
-        
-        # We build relative coordinates: map[piece_id] = (r, c)
-        # Start with each piece in its own cluster
-        clusters = [{i: (0,0)} for i in range(n)] 
-        
-        for p1, p2, rel, score in matches:
-            # Find which clusters p1 and p2 belong to
-            c1_idx = -1
-            c2_idx = -1
-            for idx, clust in enumerate(clusters):
-                if p1 in clust: c1_idx = idx
-                if p2 in clust: c2_idx = idx
-            
-            if c1_idx == c2_idx: continue # Already in same cluster
-            
-            # Merge Cluster 2 into Cluster 1
-            clust1 = clusters[c1_idx]
-            clust2 = clusters[c2_idx]
-            
-            # Calculate offset
-            r1, c1 = clust1[p1]
-            if rel == "H": # p2 is to Right of p1
-                r_target, c_target = r1, c1 + 1
-            else:          # p2 is Below p1
-                r_target, c_target = r1 + 1, c1
-            
-            # Shift cluster 2 to align with target
-            r2_curr, c2_curr = clust2[p2]
-            dr, dc = r_target - r2_curr, c_target - c2_curr
-            
-            # Add all pieces from c2 to c1
-            conflict = False
-            for p, (r, c) in clust2.items():
-                new_pos = (r + dr, c + dc)
-                if new_pos in clust1.values(): 
-                    conflict = True; break # Overlap!
-                clust1[p] = new_pos
+                r, c = idx // PUZZLE_N, idx % PUZZLE_N
                 
-            if not conflict:
-                clusters.pop(c2_idx) # Remove old cluster
-        
-        # 4. Final Grid Construction
-        # We take the largest cluster
-        largest_cluster = max(clusters, key=len)
-        
-        # Normalize coordinates
-        rs = [pos[0] for pos in largest_cluster.values()]
-        cs = [pos[1] for pos in largest_cluster.values()]
-        min_r, min_c = min(rs), min(cs)
-        
-        grid = np.full((N, N), -1, dtype=int)
-        used_pieces = set()
-        
-        for p, (r, c) in largest_cluster.items():
-            final_r, final_c = r - min_r, c - min_c
-            if 0 <= final_r < N and 0 <= final_c < N:
-                grid[final_r, final_c] = p
-                used_pieces.add(p)
+                has_neighbor = False
+                if (c > 0 and grid[idx-1] != -1) or \
+                (c < PUZZLE_N-1 and grid[idx+1] != -1) or \
+                (r > 0 and grid[idx-PUZZLE_N] != -1) or \
+                (r < PUZZLE_N-1 and grid[idx+PUZZLE_N] != -1):
+                    has_neighbor = True
                 
-        # Fill remaining holes (Greedy fallback)
-        remaining = list(set(range(n)) - used_pieces)
-        for r in range(N):
-            for c in range(N):
-                if grid[r,c] == -1 and remaining:
-                    grid[r,c] = remaining.pop(0) # Simple fallback
+                if not has_neighbor: continue
+                
+                for pid in range(self.n):
+                    if placed[pid]: continue
                     
-        # Reconstruct Image
-        rows_imgs = []
-        for r in range(N):
-            row_pieces = []
-            for c in range(N):
-                idx = grid[r,c]
-                row_pieces.append(self.pieces_bgr[idx])
-            rows_imgs.append(np.hstack(row_pieces))
+                    local_cost = 0
+                    num_edges = 0
+                    
+                    if c > 0 and grid[idx-1] != -1:
+                        local_cost += self.H[grid[idx-1], pid]
+                        num_edges += 1
+                    if c < PUZZLE_N-1 and grid[idx+1] != -1:
+                        local_cost += self.H[pid, grid[idx+1]]
+                        num_edges += 1
+                    if r > 0 and grid[idx-PUZZLE_N] != -1:
+                        local_cost += self.V[grid[idx-PUZZLE_N], pid]
+                        num_edges += 1
+                    if r < PUZZLE_N-1 and grid[idx+PUZZLE_N] != -1:
+                        local_cost += self.V[pid, grid[idx+PUZZLE_N]]
+                        num_edges += 1
+                    
+                    if num_edges == 0: continue
+                    
+                    avg_cost = local_cost / num_edges
+                    
+                    placed[pid] = True
+                    h_cost = self._heuristic(placed)
+                    placed[pid] = False
+                    
+                    f_cost = (g_cost + avg_cost) + h_cost
+                    
+                    if f_cost < best_f:
+                        best_f = f_cost
+                        best_move = (idx, pid, avg_cost)
             
-        return np.vstack(rows_imgs)
+            if best_move:
+                idx, pid, cost = best_move
+                grid[idx] = pid
+                placed[pid] = True
+                g_cost += cost
+            else:
+                remaining = [i for i in range(self.n) if not placed[i]]
+                for i, idx in enumerate(np.where(grid == -1)[0]):
+                    if i < len(remaining):
+                        grid[idx] = remaining[i]
+                break
+        
+        # Reshape to 2D visual grid
+        visual_grid = grid.reshape(PUZZLE_N, PUZZLE_N)
+        
+        # Reconstruct Visual Image
+        rows = []
+        for r in range(PUZZLE_N):
+            rows.append(np.hstack([self.pieces_bgr_scrambled[visual_grid[r,c]] for c in range(PUZZLE_N)]))
+        solved_img = np.vstack(rows)
+        
+        # Reconstruct ID Grid for accuracy
+        true_id_grid = np.zeros_like(visual_grid)
+        for r in range(PUZZLE_N):
+            for c in range(PUZZLE_N):
+                scrambled_id = visual_grid[r,c]
+                true_id_grid[r,c] = self.id_map.get(scrambled_id, -1)
+                
+        return solved_img, true_id_grid
 
 # =====================================================
-# 3. ACCURACY CHECKER (Same as before)
+# 3. NEIGHBOR ACCURACY
 # =====================================================
-def calculate_accuracy(solved_img, correct_img, N):
-    if solved_img.shape != correct_img.shape:
-        solved_img = cv2.resize(solved_img, (correct_img.shape[1], correct_img.shape[0]))
-    h, w, _ = solved_img.shape
-    ph, pw = h // N, w // N
-    correct_count = 0
-    for r in range(N):
-        for c in range(N):
-            y, x = r * ph, c * pw
-            diff = np.mean(np.abs(solved_img[y:y+ph, x:x+pw].astype(int) - correct_img[y:y+ph, x:x+pw].astype(int)))
-            if diff < 15: correct_count += 1
-    return (correct_count / (N*N)) * 100.0
+def compute_neighbor_accuracy(grid: np.ndarray) -> float:
+    rows, cols = grid.shape
+    correct_neighbors = 0
+    total_boundaries = 0
+    
+    for r in range(rows):
+        for c in range(cols):
+            piece_a = grid[r, c]
+            if piece_a == -1: continue
+            
+            # Check RIGHT neighbor
+            if c < cols - 1:
+                piece_b = grid[r, c + 1]
+                total_boundaries += 1
+                if piece_b != -1 and piece_a % cols < cols - 1 and piece_b == piece_a + 1:
+                    correct_neighbors += 1
+            
+            # Check BOTTOM neighbor
+            if r < rows - 1:
+                piece_b = grid[r + 1, c]
+                total_boundaries += 1
+                if piece_b != -1 and piece_a // cols < rows - 1 and piece_b == piece_a + cols:
+                    correct_neighbors += 1
+    
+    if total_boundaries == 0:
+        return 0.0
+    
+    return correct_neighbors / total_boundaries
 
 # =====================================================
-# 4. MAIN LOOP
+# 4. MAIN EXECUTION
 # =====================================================
 if __name__ == "__main__":
     if not os.path.exists(OUTPUT_FOLDER): os.makedirs(OUTPUT_FOLDER)
     
-    correct_map = {}
-    if os.path.exists(CORRECT_FOLDER):
-        for f in os.listdir(CORRECT_FOLDER):
-            correct_map[os.path.splitext(f)[0]] = f
-            
-    files = [f for f in os.listdir(PUZZLE_FOLDER) if f.lower().endswith(('.png', '.jpg'))]
-    print(f"--- BEST BUDDIES SOLVER ({len(files)} puzzles) ---")
+    correct_map = {os.path.splitext(f)[0]: f for f in os.listdir(CORRECT_FOLDER)} if os.path.exists(CORRECT_FOLDER) else {}
+    puzzle_files = [f for f in os.listdir(PUZZLE_FOLDER) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     
-    total_acc = 0
+    print(f"--- SOLVING {len(puzzle_files)} 8x8 PUZZLES ---")
+    print(f"{'Image':<30} | {'Neighbor Accuracy':<20}")
+    print("-" * 55)
+
+    total_neighbor_acc = 0
     count = 0
-    
-    for f in files:
+
+    for p_file in puzzle_files:
         try:
-            solver = JigsawSolverBestBuddies(os.path.join(PUZZLE_FOLDER, f))
-            res = solver.solve()
-            cv2.imwrite(os.path.join(OUTPUT_FOLDER, f.replace(".jpg",".png")), res)
+            c_file = correct_map.get(os.path.splitext(p_file)[0])
+            c_path = os.path.join(CORRECT_FOLDER, c_file) if c_file else None
             
-            c_name = correct_map.get(os.path.splitext(f)[0])
-            acc = 0
-            if c_name:
-                acc = calculate_accuracy(res, cv2.imread(os.path.join(CORRECT_FOLDER, c_name)), N)
-                total_acc += acc
-                count += 1
+            solver = EfficientAStarSolver8x8(os.path.join(PUZZLE_FOLDER, p_file), c_path)
+            solved_img, true_id_grid = solver.solve()
             
-            print(f"{f:<20} | {acc:>5.1f}%")
+            cv2.imwrite(os.path.join(OUTPUT_FOLDER, f"{os.path.splitext(p_file)[0]}_solved.png"), solved_img)
+            
+            # Accuracy
+            neighbor_acc = compute_neighbor_accuracy(true_id_grid) * 100
+            total_neighbor_acc += neighbor_acc
+            
+            count += 1
+            print(f"{p_file:<30} | {neighbor_acc:>10.1f}%")
+            
         except Exception as e:
-            print(f"Error {f}: {e}")
-            
-    if count: print(f"Avg: {total_acc/count:.2f}%")
-    
+            print(f"{p_file:<30} | ERROR: {e}")
+
+    if count > 0:
+        print("-" * 55)
+        print(f"Average Neighbor Accuracy: {total_neighbor_acc/count:.2f}%")
